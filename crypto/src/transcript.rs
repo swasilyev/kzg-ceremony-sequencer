@@ -1,6 +1,7 @@
 use super::{CeremonyError, Contribution, Powers, G1, G2};
 use crate::{engine::Engine, signature::BlsSignature};
 use serde::{Deserialize, Serialize};
+use rayon::iter::{ParallelIterator, IntoParallelRefIterator, IndexedParallelIterator};
 use tracing::instrument;
 
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
@@ -67,9 +68,93 @@ impl Transcript {
         }
     }
 
+    // Verifies that it is a valid transcript itself
+    pub fn verify_self<E: Engine>(
+        &self,
+        num_g1: usize,
+        num_g2: usize,
+    ) -> Result<(), CeremonyError> {
+        // Sanity checks on provided num_g1 and num_g2
+        assert!(num_g1 >= 2);
+        assert!(num_g2 >= 2);
+        assert!(num_g1 >= num_g2);
+
+        // Num powers checks
+        // Note: num_g1_powers and num_g2_powers checked in TryFrom<PowersJson>
+        if num_g1 != self.powers.g1.len() {
+            return Err(CeremonyError::UnexpectedNumG1Powers(
+                num_g1,
+                self.powers.g1.len(),
+            ));
+        }
+        if num_g2 != self.powers.g2.len() {
+            return Err(CeremonyError::UnexpectedNumG2Powers(
+                num_g2,
+                self.powers.g2.len(),
+            ));
+        }
+
+        // Sanity checks on num pubkeys & products
+        if self.witness.products.len() != self.witness.pubkeys.len() {
+            return Err(CeremonyError::WitnessLengthMismatch(
+                self.witness.products.len(),
+                self.witness.pubkeys.len(),
+            ));
+        }
+
+        // Point sanity checks (encoding and subgroup checks).
+        E::validate_g1(&self.powers.g1)?;
+        E::validate_g2(&self.powers.g2)?;
+        E::validate_g1(&self.witness.products)?;
+        E::validate_g2(&self.witness.pubkeys)?;
+
+        // Non-zero checks
+        if self
+            .witness
+            .pubkeys
+            .par_iter()
+            .any(|pubkey| *pubkey == G2::zero())
+        {
+            return Err(CeremonyError::ZeroPubkey);
+        }
+
+        // Pairing check all pubkeys
+        // TODO: figure out how to do this with some kind of batched pairings
+        if self
+            .witness
+            .products
+            .par_iter()
+            .enumerate()
+            .filter(|(i, _)| i >=  &self.witness.products.len())
+            .any(|(i, product)|
+                E::verify_pubkey(
+                    *product,
+                    self.witness.products[i - 1],
+                    self.witness.pubkeys[i],
+                ).is_err()
+            )
+        {
+            return Err(CeremonyError::PubKeyPairingFailed);
+        }
+
+        // Verify powers match final witness product
+        if self.powers.g1[1] != self.witness.products[self.witness.products.len() - 1] {
+            return Err(CeremonyError::G1ProductMismatch);
+        }
+
+        // Verify powers are correctly constructed
+        E::verify_g1(&self.powers.g1, self.powers.g2[1])?;
+        E::verify_g2(&self.powers.g1[..self.powers.g2.len()], &self.powers.g2)?;
+
+        Ok(())
+    }
+
     /// Verifies a contribution.
     #[instrument(level = "info", skip_all, fields(n1=self.powers.g1.len(), n2=self.powers.g2.len()))]
-    pub fn verify<E: Engine>(&self, contribution: &Contribution) -> Result<(), CeremonyError> {
+    pub fn verify_contribution<E: Engine>(
+        &self,
+        contribution: &Contribution,
+    ) -> Result<(), CeremonyError> {
         // Compatibility checks
         if self.powers.g1.len() != contribution.powers.g1.len() {
             return Err(CeremonyError::UnexpectedNumG1Powers(
@@ -184,7 +269,7 @@ mod test {
             bls_signature: BlsSignature::empty(),
         };
         let result = transcript
-            .verify::<DefaultEngine>(&bad_g1_contribution)
+            .verify_contribution::<DefaultEngine>(&bad_g1_contribution)
             .err()
             .unwrap();
         assert!(matches!(result, InvalidG1Power(_, InvalidSubgroup)));
@@ -204,7 +289,7 @@ mod test {
             bls_signature: BlsSignature::empty(),
         };
         let result = transcript
-            .verify::<DefaultEngine>(&bad_g2_contribution)
+            .verify_contribution::<DefaultEngine>(&bad_g2_contribution)
             .err()
             .unwrap();
         assert!(matches!(result, InvalidG2Power(_, InvalidSubgroup)));
@@ -243,7 +328,7 @@ mod test {
         };
         assert_eq!(
             transcript
-                .verify::<DefaultEngine>(&bad_pot_pubkey)
+                .verify_contribution::<DefaultEngine>(&bad_pot_pubkey)
                 .err()
                 .unwrap(),
             PubKeyPairingFailed
@@ -275,7 +360,7 @@ mod test {
         };
         assert_eq!(
             transcript
-                .verify::<DefaultEngine>(&contribution)
+                .verify_contribution::<DefaultEngine>(&contribution)
                 .err()
                 .unwrap(),
             G1PairingFailed
@@ -310,7 +395,7 @@ mod test {
         };
         assert_eq!(
             transcript
-                .verify::<DefaultEngine>(&contribution)
+                .verify_contribution::<DefaultEngine>(&contribution)
                 .err()
                 .unwrap(),
             G2PairingFailed
@@ -323,7 +408,7 @@ mod test {
         let mut contribution = transcript.contribution();
         contribution.powers.g1 = contribution.powers.g1[0..2].to_vec();
         let result = transcript
-            .verify::<DefaultEngine>(&contribution)
+            .verify_contribution::<DefaultEngine>(&contribution)
             .err()
             .unwrap();
         assert_eq!(result, UnexpectedNumG1Powers(3, 2));
@@ -335,7 +420,7 @@ mod test {
         let mut contribution = transcript.contribution();
         contribution.powers.g2 = contribution.powers.g2[0..2].to_vec();
         let result = transcript
-            .verify::<DefaultEngine>(&contribution)
+            .verify_contribution::<DefaultEngine>(&contribution)
             .err()
             .unwrap();
         assert_eq!(result, UnexpectedNumG2Powers(3, 2));
